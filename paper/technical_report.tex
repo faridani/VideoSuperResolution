@@ -3,6 +3,7 @@
 \usepackage{amsfonts}
 \usepackage{graphicx}
 \usepackage{hyperref}
+\usepackage{tikz}
 \usepackage{natbib}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning}
@@ -110,8 +111,11 @@ While comprehensive experiments are outside the scope of this code-only release,
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.9\textwidth]{qualitative_examples.pdf}
-\caption{Example frames comparing bicubic upscaling (left) and our method (right).}
+\begin{tikzpicture}
+  \node[draw,minimum width=4cm,minimum height=3cm] (a) at (0,0) {Bicubic};
+  \node[draw,minimum width=4cm,minimum height=3cm] (b) at (5,0) {Ours};
+\end{tikzpicture}
+\caption{Placeholder comparison of bicubic upscaling (left) and our method (right).}
 \label{fig:qual}
 \end{figure}
 
