@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import cv2
 import numpy as np
+import random
 import clip
 from torchvision.models import vgg16
 from diffusers import StableDiffusionPipeline
@@ -35,6 +36,20 @@ class VideoSuperResDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _degrade(self, frame):
+        """Apply random degradation to generate a low resolution frame."""
+        if random.random() < 0.5:
+            ksize = random.choice([3, 5])
+            frame = cv2.GaussianBlur(frame, (ksize, ksize), 0)
+        if random.random() < 0.5:
+            noise_std = random.uniform(0, 10)
+            noise = np.random.normal(0, noise_std, frame.shape).astype(np.float32)
+            frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        interp_methods = [cv2.INTER_AREA, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_LANCZOS4]
+        interp = random.choice(interp_methods)
+        lr = cv2.resize(frame, (frame.shape[1] // self.scale, frame.shape[0] // self.scale), interpolation=interp)
+        return lr
+
     def __getitem__(self, idx):
         video_file, start_idx = self.samples[idx]
         cap = cv2.VideoCapture(video_file)
@@ -51,7 +66,7 @@ class VideoSuperResDataset(Dataset):
         hr_frames = np.stack(hr_frames, axis=0)
         lr_frames = []
         for frame in hr_frames:
-            lr = cv2.resize(frame, (frame.shape[1] // self.scale, frame.shape[0] // self.scale), interpolation=cv2.INTER_CUBIC)
+            lr = self._degrade(frame)
             lr_frames.append(lr)
         lr_frames = np.stack(lr_frames, axis=0)
         hr_frames = (hr_frames.astype(np.float32) / 255.0).transpose(3, 0, 1, 2)

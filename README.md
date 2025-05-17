@@ -1,6 +1,6 @@
 # Video Super Resolution
 
-This project provides a PyTorch implementation of a state-of-the-art video super resolution model. A short sliding window of low resolution frames is processed to produce a high resolution output (e.g. 4K). The architecture combines modern techniques for spatial detail and temporal consistency.
+This project provides a PyTorch implementation of a state-of-the-art video super resolution model. A short sliding window of frames is processed to produce a high resolution output (e.g. 4K). During training only high quality videos are required; lower resolution inputs are created on the fly through random degradations. The architecture combines modern techniques for spatial detail and temporal consistency.
 
 ## Key Features
 
@@ -13,7 +13,7 @@ This project provides a PyTorch implementation of a state-of-the-art video super
 
 ## Training
 
-The main training script is `video_sr.py`. It expects a directory of video files (e.g. MP4, AVI) rather than pre-extracted PNG frames.
+The main training script is `video_sr.py`. It expects a directory of high resolution video files (e.g. MP4, AVI) rather than pre-extracted PNG frames. Low resolution inputs are generated internally using random downscaling, blur and noise so no separate low quality dataset is needed.
 
 ```bash
 python video_sr.py
