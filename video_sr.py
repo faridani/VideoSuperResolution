@@ -1,81 +1,123 @@
-import os
 import glob
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import os
+import random
+from typing import Callable, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import random
-import clip
-from torchvision.models import vgg16
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from diffusers import StableDiffusionPipeline
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models import vgg16
+import clip
+
+
+VIDEO_EXTS: Tuple[str, ...] = (
+    "*.mp4",
+    "*.avi",
+    "*.mov",
+    "*.mkv",
+    "*.mpg",
+    "*.mpeg",
+)
 
 
 class VideoSuperResDataset(Dataset):
     """Dataset for video super-resolution training."""
 
-    def __init__(self, video_dir, window_size=5, scale=4, transform=None):
-        """Initialize dataset with a directory of video files."""
-        exts = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.mpg", "*.mpeg")
-        self.video_files = []
-        for ext in exts:
-            self.video_files.extend(glob.glob(os.path.join(video_dir, ext)))
+    def __init__(
+        self,
+        video_dir: str,
+        window_size: int = 5,
+        scale: int = 4,
+        transform: Optional[Callable] = None,
+    ) -> None:
+        """Collect samples from all videos in ``video_dir``."""
+
+        self.video_files: List[str] = [
+            file
+            for ext in VIDEO_EXTS
+            for file in glob.glob(os.path.join(video_dir, ext))
+        ]
         self.window_size = window_size
         self.scale = scale
         self.transform = transform
-        self.samples = []
+        self.samples = self._collect_samples()
+
+    def _collect_samples(self) -> List[Tuple[str, int]]:
+        samples = []
         for vfile in self.video_files:
             cap = cv2.VideoCapture(vfile)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
-            for i in range(0, frame_count - window_size + 1):
-                self.samples.append((vfile, i))
+            for start in range(0, frame_count - self.window_size + 1):
+                samples.append((vfile, start))
+        return samples
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def _degrade(self, frame):
+    def _degrade(self, frame: np.ndarray) -> np.ndarray:
         """Apply random degradation to generate a low resolution frame."""
+
         if random.random() < 0.5:
             ksize = random.choice([3, 5])
             frame = cv2.GaussianBlur(frame, (ksize, ksize), 0)
+
         if random.random() < 0.5:
             noise_std = random.uniform(0, 10)
             noise = np.random.normal(0, noise_std, frame.shape).astype(np.float32)
             frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-        interp_methods = [cv2.INTER_AREA, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_LANCZOS4]
+
+        interp_methods = [
+            cv2.INTER_AREA,
+            cv2.INTER_LINEAR,
+            cv2.INTER_CUBIC,
+            cv2.INTER_LANCZOS4,
+        ]
         interp = random.choice(interp_methods)
-        lr = cv2.resize(frame, (frame.shape[1] // self.scale, frame.shape[0] // self.scale), interpolation=interp)
+        lr = cv2.resize(
+            frame,
+            (frame.shape[1] // self.scale, frame.shape[0] // self.scale),
+            interpolation=interp,
+        )
         return lr
 
-    def __getitem__(self, idx):
-        video_file, start_idx = self.samples[idx]
+    def _read_window(self, video_file: str, start: int) -> np.ndarray:
         cap = cv2.VideoCapture(video_file)
-        hr_frames = []
-        for i in range(start_idx, start_idx + self.window_size):
+        frames = []
+        for i in range(start, start + self.window_size):
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
             if not ret:
                 cap.release()
                 raise ValueError(f"Could not read frame {i} from {video_file}")
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            hr_frames.append(frame)
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()
-        hr_frames = np.stack(hr_frames, axis=0)
-        lr_frames = []
-        for frame in hr_frames:
-            lr = self._degrade(frame)
-            lr_frames.append(lr)
-        lr_frames = np.stack(lr_frames, axis=0)
+        return np.stack(frames, axis=0)
+
+    def _generate_lr_stack(self, hr_stack: np.ndarray) -> np.ndarray:
+        lr_frames = [self._degrade(frame) for frame in hr_stack]
+        return np.stack(lr_frames, axis=0)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        video_file, start_idx = self.samples[idx]
+        hr_frames = self._read_window(video_file, start_idx)
+        lr_frames = self._generate_lr_stack(hr_frames)
+
         hr_frames = (hr_frames.astype(np.float32) / 255.0).transpose(3, 0, 1, 2)
         lr_frames = (lr_frames.astype(np.float32) / 255.0).transpose(3, 0, 1, 2)
+
         hr_tensor = torch.from_numpy(hr_frames)
         lr_tensor = torch.from_numpy(lr_frames)
+
         if self.transform:
             hr_tensor = self.transform(hr_tensor)
             lr_tensor = self.transform(lr_tensor)
+
         return lr_tensor, hr_tensor
 
 
@@ -264,31 +306,50 @@ class VideoSuperResolutionDiffusionModel(nn.Module):
         return refined_sr
 
 
-def train_model(model, dataloader, num_epochs, device):
+def train_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    num_epochs: int,
+    device: torch.device,
+) -> None:
+    """Simple training loop printing average loss per epoch."""
+
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     l1_loss_fn = nn.L1Loss()
     perceptual_loss_fn = PerceptualLoss(device)
     clip_loss_fn = CLIPLoss(device)
+
     model.train()
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         for lr_seq, hr_seq in dataloader:
             lr_seq = lr_seq.to(device)
             hr_seq = hr_seq.to(device)
+
             optimizer.zero_grad()
             sr = model(lr_seq)
             hr_central = hr_seq[:, :, hr_seq.size(2) // 2, :, :]
+
             loss_l1 = l1_loss_fn(sr, hr_central)
             loss_perc = perceptual_loss_fn(sr, hr_central)
             loss_clip = clip_loss_fn(sr, hr_central)
+
             sr_seq = sr.unsqueeze(1).repeat(1, lr_seq.size(2), 1, 1, 1)
             loss_temp = temporal_consistency_loss(sr_seq)
-            total_loss = loss_l1 + 0.1 * loss_perc + 0.1 * loss_clip + 0.5 * loss_temp
+
+            total_loss = (
+                loss_l1
+                + 0.1 * loss_perc
+                + 0.1 * loss_clip
+                + 0.5 * loss_temp
+            )
             total_loss.backward()
             optimizer.step()
             epoch_loss += total_loss.item()
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss/len(dataloader):.4f}")
+
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}")
 
 
 if __name__ == "__main__":
