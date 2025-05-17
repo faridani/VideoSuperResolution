@@ -1,0 +1,52 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\title{Video Super Resolution with Diffusion-Based Refinement}
+\author{Project Report}
+\date{\today}
+\begin{document}
+\maketitle
+\section{Introduction}
+This report describes a PyTorch implementation of a video super resolution model located in \texttt{video\_sr.py}. The model takes a short sliding window of low resolution frames and produces a high resolution output. Key components include spatio--temporal encoding, a transformer bottleneck, a U-Net style decoder, deformable convolutions, and a diffusion-based refinement stage. Training leverages perceptual and semantic losses for improved visual quality.
+\section{Model Overview}
+The model \texttt{VideoSuperResolutionDiffusionModel} consists of an encoder, temporal fusion, transformer bottleneck, decoder, and diffusion refinement block. Given an input tensor $X \in \mathbb{R}^{B\times C\times T\times H\times W}$ with $B$ batches, $C$ channels, temporal length $T$, and spatial dimensions $H\times W$, the forward pass is:
+\begin{equation}
+\mathrm{SR} = \mathrm{DiffusionRefinement}(\mathrm{Decoder2D}(\mathrm{TransformerBottleneck}(\mathrm{TemporalFusion}(\mathrm{Encoder3D}(X))))).
+\end{equation}
+\section{Spatio--Temporal Encoding}
+The \texttt{Encoder3D} module applies 3D convolutions to capture correlations along both spatial and temporal axes. A 3D convolution with kernel $K \in \mathbb{R}^{C_{out}\times C_{in}\times k_t\times k_h\times k_w}$ at position $(t,i,j)$ is given by
+\begin{equation}
+Y(t,i,j) = \sum_{c=1}^{C_{in}}\sum_{a=1}^{k_t}\sum_{b=1}^{k_h}\sum_{d=1}^{k_w} K(c,a,b,d)\, X_{c}(t+a,i+b,j+d).
+\end{equation}
+This operation maintains temporal structure while reducing the resolution via strided convolutions.
+\section{U-Net Decoder with Pixel Shuffle}
+The \texttt{Decoder2D} upsamples features back to high resolution. Pixel shuffle is used to increase spatial dimensions without checkerboard artifacts. For a scale factor $s$, a convolution output with $s^2$ times more channels is rearranged into an $s$ times larger spatial map. Formally, for output tensor $F \in \mathbb{R}^{B\times C\,s^{2}\times H\times W}$, pixel shuffle rearranges it to $\mathbb{R}^{B\times C\times sH\times sW}$ by interleaving channels.
+\section{Transformer Bottleneck}
+Non--local interactions are modeled with a transformer encoder block. Features are flattened into tokens and passed through self--attention:
+\begin{equation}
+\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^{\top}}{\sqrt{d}}\right)V,
+\end{equation}
+where $Q,K,V$ are linear projections of the flattened feature map and $d$ is the dimension of each head. This enables long-range spatial reasoning across the frame.
+\section{Deformable Convolution Alignment}
+To better align neighboring frames, deformable convolutions learn offsets $\Delta p$ for each sampling location. Given input $X$ and offsets $\Delta p_{k}$ for each kernel position $p_{k}$, the output is
+\begin{equation}
+Y(p) = \sum_{k} w_{k} \; X(p+p_{k}+\Delta p_{k}).
+\end{equation}
+This allows the network to adaptively sample from spatially shifted positions, improving correspondence between frames. The current repository uses a placeholder standard convolution in \texttt{DeformableConv2d} that can be replaced with an actual implementation.
+\section{Diffusion Refinement}
+The \texttt{DiffusionRefinement} block loads a pretrained Stable Diffusion XL UNet. During forward passes it predicts a noise residual $\epsilon$ at a fixed diffusion timestep $t$ and adds it to the decoded frame:
+\begin{equation}
+\hat{X} = \mathrm{clip}(X + \epsilon, 0, 1).
+\end{equation}
+This step provides high frequency detail learned by the large diffusion model without additional training of the UNet parameters.
+\section{Loss Functions}
+Training minimizes a sum of terms:
+\begin{align}
+\mathcal{L} &= \mathcal{L}_{\mathrm{L1}}(\mathrm{SR}, Y) + \lambda_{p} \mathcal{L}_{\mathrm{perc}}(\mathrm{SR}, Y) + \lambda_{c} \mathcal{L}_{\mathrm{CLIP}}(\mathrm{SR}, Y) \\
+&\quad+ \lambda_{t} \mathcal{L}_{\mathrm{temp}}(\mathrm{SR\;sequence}).
+\end{align}
+Here $\mathcal{L}_{\mathrm{L1}}$ is pixel-wise reconstruction, $\mathcal{L}_{\mathrm{perc}}$ a VGG16 based perceptual loss, $\mathcal{L}_{\mathrm{CLIP}}$ a semantic similarity loss computed with a pretrained CLIP image encoder, and $\mathcal{L}_{\mathrm{temp}}$ penalizes inconsistency across adjacent frames.
+\section{Conclusion}
+This implementation demonstrates a compact yet feature-rich approach to video super resolution. The combination of spatio--temporal encoding, transformer reasoning, deformable alignment and diffusion-based refinement provides high quality results while relying only on standard PyTorch modules and pretrained networks.
+\end{document}
