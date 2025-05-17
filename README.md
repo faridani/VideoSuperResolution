@@ -13,7 +13,7 @@ This project provides a PyTorch implementation of a state-of-the-art video super
 
 ## Training
 
-The main training script is `video_sr.py`. It expects a directory of videos where each video is stored as a folder of PNG frames.
+The main training script is `video_sr.py`. It expects a directory of video files (e.g. MP4, AVI) rather than pre-extracted PNG frames.
 
 ```bash
 python video_sr.py
