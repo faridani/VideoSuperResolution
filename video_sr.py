@@ -16,28 +16,38 @@ class VideoSuperResDataset(Dataset):
     """Dataset for video super-resolution training."""
 
     def __init__(self, video_dir, window_size=5, scale=4, transform=None):
-        self.video_dirs = glob.glob(os.path.join(video_dir, "*"))
+        """Initialize dataset with a directory of video files."""
+        exts = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.mpg", "*.mpeg")
+        self.video_files = []
+        for ext in exts:
+            self.video_files.extend(glob.glob(os.path.join(video_dir, ext)))
         self.window_size = window_size
         self.scale = scale
         self.transform = transform
         self.samples = []
-        for vdir in self.video_dirs:
-            frames = sorted(glob.glob(os.path.join(vdir, "*.png")))
-            num_frames = len(frames)
-            for i in range(0, num_frames - window_size + 1):
-                self.samples.append((vdir, i))
+        for vfile in self.video_files:
+            cap = cv2.VideoCapture(vfile)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            for i in range(0, frame_count - window_size + 1):
+                self.samples.append((vfile, i))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        video_folder, start_idx = self.samples[idx]
-        frame_paths = sorted(glob.glob(os.path.join(video_folder, "*.png")))
+        video_file, start_idx = self.samples[idx]
+        cap = cv2.VideoCapture(video_file)
         hr_frames = []
         for i in range(start_idx, start_idx + self.window_size):
-            frame = cv2.imread(frame_paths[i])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                cap.release()
+                raise ValueError(f"Could not read frame {i} from {video_file}")
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             hr_frames.append(frame)
+        cap.release()
         hr_frames = np.stack(hr_frames, axis=0)
         lr_frames = []
         for frame in hr_frames:
@@ -267,7 +277,7 @@ def train_model(model, dataloader, num_epochs, device):
 
 
 if __name__ == "__main__":
-    video_data_dir = "./video_frames"
+    video_data_dir = "./videos"
     window_size = 5
     scale = 4
     num_epochs = 50
