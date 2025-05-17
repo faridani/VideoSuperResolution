@@ -4,6 +4,8 @@
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{natbib}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning}
 \title{Video Super Resolution with Diffusion-Based Refinement}
 \author{Project Report}
 \date{\today}
@@ -30,7 +32,23 @@ A schematic is shown in Figure~\ref{fig:architecture}.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.8\textwidth]{architecture.pdf}
+\resizebox{0.8\textwidth}{!}{%
+\begin{tikzpicture}[node distance=1.6cm, >=Stealth]
+    \node[draw, rectangle] (input) {Input Frames};
+    \node[draw, rectangle, right=of input] (conv) {3D Convolution};
+    \node[draw, rectangle, right=of conv] (fusion) {Temporal Fusion};
+    \node[draw, rectangle, right=of fusion] (trans) {Transformer};
+    \node[draw, rectangle, right=of trans] (decoder) {Pixel Shuffle Decoder};
+    \node[draw, rectangle, right=of decoder] (diff) {Diffusion Refinement};
+    \node[draw, rectangle, right=of diff] (output) {Output Frame};
+    \draw[->] (input) -- (conv);
+    \draw[->] (conv) -- (fusion);
+    \draw[->] (fusion) -- (trans);
+    \draw[->] (trans) -- (decoder);
+    \draw[->] (decoder) -- (diff);
+    \draw[->] (diff) -- (output);
+\end{tikzpicture}%
+}
 \caption{High-level overview of the video super-resolution pipeline implemented in this project.}
 \label{fig:architecture}
 \end{figure}
