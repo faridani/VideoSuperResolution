@@ -16,6 +16,7 @@
 \newpage
 \section{Introduction}
 Video super resolution (VSR) aims to reconstruct high-resolution (HR) frames from low-resolution (LR) video sequences. The ability to enhance temporal sequences has wide applications ranging from video streaming to medical imaging. This report accompanies the PyTorch implementation in \texttt{video\_sr.py} and explains the design decisions behind the model. We emphasize how spatial and temporal features are captured, how transformer and diffusion components are integrated, and how losses encourage perceptually pleasing outputs.
+Recent updates add progressively stronger degradations during training, an optical-flow based consistency loss, and an adaptive diffusion timestep predictor to better refine details.
 
 \section{Literature Survey}
 In this section we briefly summarize prior work relevant to video super resolution and generative refinement. Early approaches relied on motion-compensated filtering \cite{Tekalp1995}. Deep learning methods such as VSRnet \cite{Kappeler2016} and VDSR \cite{Kim2016} introduced convolutional neural networks for frame upscaling. Later, recurrent architectures like STCN \cite{Dai2017} and transformer models like BasicVSR++ \cite{Chan2022} improved temporal consistency. Diffusion-based models have recently been applied to super resolution \cite{Saharia2022}. Our implementation combines ideas from these works: a 3D convolutional encoder captures short-term motion, a transformer bottleneck enables long-range reasoning, deformable convolutions provide alignment, and a pre-trained diffusion model injects high frequency details.
@@ -55,25 +56,25 @@ A schematic is shown in Figure~\ref{fig:architecture}.
 \end{figure}
 
 \section{Spatio-Temporal Encoding}
-The encoder applies a series of 3D convolutions to capture correlations along both spatial and temporal axes. Formally, a 3D convolution with kernel $K \in \mathbb{R}^{C_{out}\times C_{in}\times k_t\times k_h\times k_w}$ at location $(t,i,j)$ is defined as
+The encoder applies a series of 3D convolutions to capture correlations along both spatial and temporal axes. Unlike standard 2D convolutions that operate on individual frames, 3D kernels slide across the time dimension as well. Formally, a 3D convolution with kernel $K \in \mathbb{R}^{C_{out}\times C_{in}\times k_t\times k_h\times k_w}$ at location $(t,i,j)$ is defined as
 \begin{equation}
 Y(t,i,j) = \sum_{c=1}^{C_{in}} \sum_{a=1}^{k_t} \sum_{b=1}^{k_h} \sum_{d=1}^{k_w} K(c,a,b,d) \, X_{c}(t+a,i+b,j+d).
 \end{equation}
-Strided convolutions reduce the spatial resolution while increasing the receptive field. By stacking such layers, short-term motion information is embedded into the feature maps.
+Strided convolutions reduce the spatial resolution while increasing the receptive field. By stacking such layers, motion cues spanning several frames are embedded into the feature maps.
 
 \section{Temporal Fusion}
-After encoding, temporal dimensions are collapsed to a single representation using average pooling and a 2D convolution. Let $F \in \mathbb{R}^{B\times C\times T\times h\times w}$ denote encoded features. Temporal fusion computes
+After encoding, temporal dimensions are collapsed with an attention-based fusion mechanism. A 3D convolution first aggregates features, then an optional attention branch predicts weights for each time step. Let $F \in \mathbb{R}^{B\times C\times T\times h\times w}$ denote encoded features and $A \in \mathbb{R}^{B\times 1\times T\times h\times w}$ the attention logits. Temporal fusion computes
 \begin{equation}
-G = \mathrm{Conv2D}\big(\frac{1}{T} \sum_{t=1}^{T} F(:, :, t, :, :)\big).
+w_t = \mathrm{softmax}(A_t), \qquad G = \sum_{t=1}^{T} w_t \, F_t.
 \end{equation}
-This step provides a compact summary over the window of frames.
+If attention is disabled, simple averaging over time is used. This step provides a compact summary of the window and allows the model to focus on more informative frames.
 
 \section{Transformer Bottleneck}
-Non-local interactions are modeled with a transformer encoder. Features are flattened into tokens, projected into queries $Q$, keys $K$, and values $V$, and processed with multi-head attention:
+Non-local interactions are modeled with a lightweight Linformer-style transformer encoder. Features are flattened into tokens, projected into queries $Q$, keys $K$, and values $V$. The keys and values are further projected into low-rank spaces using learnable matrices $E$ and $F$ to reduce the computational cost:
 \begin{equation}
-\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^{\top}}{\sqrt{d}}\right)V.
+K' = KE, \qquad V' = VF, \qquad \mathrm{Attention}(Q,K',V') = \mathrm{softmax}\left(\frac{Q {K'}^{\top}}{\sqrt{d}}\right)V'.
 \end{equation}
-Here $d$ denotes the dimension of each attention head. The transformer enables reasoning about long-range dependencies and global scene structure, which are difficult to capture with purely local convolutions.
+This formulation scales well to high-resolution feature maps while still enabling reasoning about long-range dependencies and global scene structure.
 
 \section{U-Net Decoder with Pixel Shuffle}
 The decoder upsamples features back to the target resolution. Each upsampling stage uses a convolution followed by pixel shuffle to increase spatial size without checkerboard artifacts. For a scale factor $s$, pixel shuffle rearranges a tensor $F \in \mathbb{R}^{B\times C\,s^2\times H\times W}$ to $\mathbb{R}^{B\times C\times sH\times sW}$. Skip connections from the encoder improve gradient flow and preserve details.
@@ -83,31 +84,32 @@ To align neighboring frames, we employ deformable convolutions \cite{Dai2017dc}.
 \begin{equation}
 Y(p) = \sum_{k} w_k\, X(p + p_k + \Delta p_k).
 \end{equation}
-This mechanism allows spatially adaptive sampling and improves correspondence between temporally adjacent frames. In the provided code, the \texttt{DeformableConv2d} class currently implements a placeholder using standard convolutions, but the structure supports integrating a full deformable convolution module.
+This mechanism allows spatially adaptive sampling and improves correspondence between temporally adjacent frames. The implementation attempts to load deformable convolution layers from \texttt{torchvision} or \texttt{mmcv}; if neither is available it gracefully falls back to a standard convolution. This design keeps the code lightweight while permitting advanced alignment modules when the dependencies are installed.
 
 \section{Diffusion Refinement}
-We load a pre-trained Stable Diffusion XL UNet \cite{Rombach2022} to enhance local details. During inference, a predicted noise residual $\epsilon$ at a fixed diffusion timestep is added to the decoded frame
+We load a pre-trained Stable Diffusion XL UNet \cite{Rombach2022} to enhance local details. A lightweight predictor estimates an appropriate diffusion timestep for each frame, enabling adaptive refinement. Let $t$ denote the chosen timestep and $\epsilon$ the predicted noise residual. The refined frame is computed as
 \begin{equation}
-\hat{X} = \mathrm{clip}(X + \epsilon, 0, 1).
+\hat{X} = \mathrm{clip}(X + \epsilon_t, 0, 1).
 \end{equation}
-This approach injects high-frequency information learned by the diffusion model without retraining the network from scratch.
+Varying $t$ allows the model to control the amount of detail added and avoids over-smoothing. This approach injects high-frequency information learned by the diffusion model without retraining the network from scratch.
 
 \section{Loss Functions}
 The training objective combines several terms:
 \begin{align}
 \mathcal{L} &= \mathcal{L}_{\mathrm{L1}}(\mathrm{SR}, Y) + \lambda_p \, \mathcal{L}_{\mathrm{perc}}(\mathrm{SR}, Y) \\
-&+ \lambda_c \, \mathcal{L}_{\mathrm{CLIP}}(\mathrm{SR}, Y) + \lambda_t \, \mathcal{L}_{\mathrm{temp}}(\mathrm{SR\;sequence}).
+&+ \lambda_c \, \mathcal{L}_{\mathrm{CLIP}}(\mathrm{SR}, Y) + \lambda_t \, \mathcal{L}_{\mathrm{temp}}(\mathrm{SR\;sequence}) \\
+&+ \lambda_f \, \mathcal{L}_{\mathrm{flow}}(\mathrm{SR\;sequence}).
 \end{align}
-Here $\mathcal{L}_{\mathrm{perc}}$ is computed with VGG16 features \cite{Simonyan2014}, $\mathcal{L}_{\mathrm{CLIP}}$ uses a pretrained CLIP image encoder \cite{Radford2021}, and $\mathcal{L}_{\mathrm{temp}}$ encourages temporal consistency between successive frames.
+Here $\mathcal{L}_{\mathrm{perc}}$ is computed with VGG16 features \cite{Simonyan2014}, $\mathcal{L}_{\mathrm{CLIP}}$ uses a pretrained CLIP image encoder \cite{Radford2021}, $\mathcal{L}_{\mathrm{temp}}$ enforces frame-to-frame coherence, and $\mathcal{L}_{\mathrm{flow}}$ penalizes misalignment based on optical flow warping.
 
 \section{Dataset and Preprocessing}
-The dataset loader expects a directory of high-resolution videos. Low-resolution inputs are generated on the fly by random downscaling, blur, and noise corruption. This strategy avoids the need for a separate low-quality dataset. Frames are extracted with OpenCV and normalized to the range $[0,1]$.
+The dataset loader expects a directory of high-resolution videos. Low-resolution inputs are generated on the fly through random downscaling, blur, noise, JPEG artifacts, and small geometric jitter. A ``degrade level'' variable controls the intensity of these corruptions and is progressively increased during training. This strategy avoids the need for a separate low-quality dataset while exposing the model to a wide range of degradations. Frames are extracted with OpenCV and normalized to the range $[0,1]$.
 
 \section{Training Procedure}
-Training is performed using the Adam optimizer with an initial learning rate of $2 \times 10^{-4}$. Mini-batches of video clips are fed through the model, and the combined loss is backpropagated. Training progress is printed after each epoch. The bottom of \texttt{video\_sr.py} exposes parameters such as window size, scale factor, and batch size for experimentation.
+Training is performed using the Adam optimizer with an initial learning rate of $2 \times 10^{-4}$. For every epoch the degrade level of the training set is gradually increased, exposing the model to more challenging corruptions over time. Mini-batches of video clips are fed through the network and the combined loss from Section~\ref{Loss Functions} is backpropagated. After each epoch the script reports the average loss as well as a validation PSNR. An optional Optuna hook can run a small hyperparameter search to tune the learning rate. The bottom of \texttt{video\_sr.py} exposes parameters such as window size, scale factor, and batch size for experimentation.
 
 \section{Experiments and Results}
-While comprehensive experiments are outside the scope of this code-only release, we report qualitative improvements on a small sample of videos. Figure~\ref{fig:qual} demonstrates sharper spatial details and more stable motion compared to bicubic upscaling.
+While comprehensive experiments are outside the scope of this code-only release, we report qualitative improvements on a small sample of videos. Validation PSNR is printed after each epoch to provide a basic quantitative measure. Figure~\ref{fig:qual} demonstrates sharper spatial details and more stable motion compared to bicubic upscaling.
 
 \begin{figure}[h]
 \centering
