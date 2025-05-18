@@ -34,6 +34,7 @@ class VideoSuperResDataset(Dataset):
         window_size: int = 5,
         scale: int = 4,
         transform: Optional[Callable] = None,
+        degrade_level: float = 0.0,
     ) -> None:
         """Collect samples from all videos in ``video_dir``."""
 
@@ -45,6 +46,7 @@ class VideoSuperResDataset(Dataset):
         self.window_size = window_size
         self.scale = scale
         self.transform = transform
+        self.degrade_level = degrade_level
         self.samples = self._collect_samples()
 
     def _collect_samples(self) -> List[Tuple[str, int]]:
@@ -63,14 +65,25 @@ class VideoSuperResDataset(Dataset):
     def _degrade(self, frame: np.ndarray) -> np.ndarray:
         """Apply random degradation to generate a low resolution frame."""
 
-        if random.random() < 0.5:
+        if random.random() < 0.5 + self.degrade_level * 0.5:
             ksize = random.choice([3, 5])
             frame = cv2.GaussianBlur(frame, (ksize, ksize), 0)
 
-        if random.random() < 0.5:
-            noise_std = random.uniform(0, 10)
+        if random.random() < 0.5 + self.degrade_level * 0.5:
+            noise_std = random.uniform(0, 10 + 20 * self.degrade_level)
             noise = np.random.normal(0, noise_std, frame.shape).astype(np.float32)
             frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+        if random.random() < 0.3 * (1 + self.degrade_level):
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), random.randint(20, 50)]
+            _, enc = cv2.imencode('.jpg', frame, encode_param)
+            frame = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+
+        if random.random() < 0.2 * (1 + self.degrade_level):
+            tx = random.randint(-2, 2)
+            ty = random.randint(-2, 2)
+            M = np.float32([[1, 0, tx], [0, 1, ty]])
+            frame = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]))
 
         interp_methods = [
             cv2.INTER_AREA,
@@ -122,13 +135,50 @@ class VideoSuperResDataset(Dataset):
 
 
 class DeformableConv2d(nn.Module):
-    """Placeholder deformable convolution layer."""
+    """Deformable convolution using torchvision/mmcv if available."""
 
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.kernel_size = kernel_size
+        self.padding = padding
+        try:
+            from torchvision.ops import DeformConv2d
+
+            self.offset_conv = nn.Conv2d(
+                in_channels,
+                2 * kernel_size * kernel_size,
+                kernel_size=kernel_size,
+                padding=padding,
+            )
+            self.dcn = DeformConv2d(
+                in_channels, out_channels, kernel_size=kernel_size, padding=padding
+            )
+            self.use_dcn = True
+        except Exception:
+            try:
+                from mmcv.ops import DeformConv2d  # type: ignore
+
+                self.offset_conv = nn.Conv2d(
+                    in_channels,
+                    2 * kernel_size * kernel_size,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                )
+                self.dcn = DeformConv2d(
+                    in_channels, out_channels, kernel_size=kernel_size, padding=padding
+                )
+                self.use_dcn = True
+            except Exception:
+                # Fall back to standard convolution if neither library is available
+                self.conv = nn.Conv2d(
+                    in_channels, out_channels, kernel_size, padding=padding
+                )
+                self.use_dcn = False
 
     def forward(self, x):
+        if self.use_dcn:
+            offset = self.offset_conv(x)
+            return self.dcn(x, offset)
         return self.conv(x)
 
 
@@ -151,44 +201,79 @@ class Encoder3D(nn.Module):
         )
 
     def forward(self, x):
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        return out
+        out1 = self.layer1(x)
+        out2 = self.layer2(out1)
+        out3 = self.layer3(out2)
+        return out3, out2, out1
 
 
 class TemporalFusion(nn.Module):
-    """Collapse temporal dimension with convolution and mean pooling."""
+    """Collapse temporal dimension using attention based weighting."""
 
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, use_attention: bool = True):
         super().__init__()
-        self.fusion_conv = nn.Conv3d(in_channels, in_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0))
+        self.use_attention = use_attention
+        self.fusion_conv = nn.Conv3d(
+            in_channels, in_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0)
+        )
+        if use_attention:
+            self.attn_conv = nn.Conv3d(
+                in_channels, 1, kernel_size=(3, 1, 1), padding=(1, 0, 0)
+            )
 
     def forward(self, x):
-        fused = self.fusion_conv(x)
-        fused = torch.mean(fused, dim=2)
+        features = self.fusion_conv(x)
+        if self.use_attention:
+            attn = self.attn_conv(x)
+            weights = torch.softmax(attn, dim=2)
+            fused = torch.sum(features * weights, dim=2)
+        else:
+            fused = torch.mean(features, dim=2)
         return fused
 
 
 class TransformerBottleneck(nn.Module):
-    """Simple vision transformer encoder block."""
+    """Linformer style transformer encoder for efficiency."""
 
-    def __init__(self, embed_dim, num_heads=4):
+    def __init__(self, embed_dim, num_heads=4, proj_k=64):
         super().__init__()
-        self.norm = nn.LayerNorm(embed_dim)
-        self.transformer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.num_heads = num_heads
+        self.proj_k = proj_k
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.E = nn.Parameter(torch.randn(proj_k, embed_dim))
+        self.F = nn.Parameter(torch.randn(proj_k, embed_dim))
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
 
     def forward(self, x):
         B, C, H, W = x.size()
-        x_flat = x.view(B, C, -1).permute(0, 2, 1)
-        x_norm = self.norm(x_flat)
-        x_trans = self.transformer(x_norm)
-        out = x_trans.permute(0, 2, 1).view(B, C, H, W)
+        x = x.view(B, C, -1).permute(0, 2, 1)  # B L C
+        x_norm = self.norm1(x)
+        Q = self.q_proj(x_norm)
+        K = self.k_proj(x_norm)
+        V = self.v_proj(x_norm)
+        K_lin = torch.einsum("blc,kc->blk", K, self.E)
+        V_lin = torch.einsum("blc,kc->blk", V, self.F)
+        attn_scores = torch.einsum("blc,blk->blk", Q, K_lin) / (C ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_out = torch.einsum("blk,blk->blc", attn_weights, V_lin)
+        out = self.out_proj(attn_out)
+        x = x + out
+        x = x + self.ffn(self.norm2(x))
+        out = x.permute(0, 2, 1).view(B, C, H, W)
         return out
 
 
 class Decoder2D(nn.Module):
-    """U-Net style decoder with pixel shuffle and deformable conv."""
+    """U-Net style decoder with pixel shuffle, deformable conv and skip fusion."""
 
     def __init__(self, in_channels, base_channels=64, scale=4):
         super().__init__()
@@ -197,17 +282,23 @@ class Decoder2D(nn.Module):
             nn.PixelShuffle(2),
             nn.ReLU(inplace=True),
         )
+        self.conv1 = nn.Conv2d(base_channels * 4 + base_channels * 2, base_channels * 2, kernel_size=3, padding=1)
         self.up2 = nn.Sequential(
-            nn.Conv2d(base_channels * 4 // (2 ** 2), base_channels * 2, kernel_size=3, padding=1),
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
             nn.PixelShuffle(2),
             nn.ReLU(inplace=True),
         )
-        self.deform_conv = DeformableConv2d(base_channels * 2 // (2 ** 2), base_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(base_channels + base_channels, base_channels, kernel_size=3, padding=1)
+        self.deform_conv = DeformableConv2d(base_channels, base_channels, kernel_size=3, padding=1)
         self.final_conv = nn.Conv2d(base_channels, 3, kernel_size=3, padding=1)
 
-    def forward(self, x):
+    def forward(self, x, skip2, skip1):
         x = self.up1(x)
+        x = torch.cat([x, skip2], dim=1)
+        x = F.relu(self.conv1(x), inplace=True)
         x = self.up2(x)
+        x = torch.cat([x, skip1], dim=1)
+        x = F.relu(self.conv2(x), inplace=True)
         x = self.deform_conv(x)
         out = self.final_conv(x)
         return out
@@ -224,11 +315,20 @@ class DiffusionRefinement(nn.Module):
         self.pipeline.to(device)
         for param in self.pipeline.unet.parameters():
             param.requires_grad = False
+        self.timestep_predictor = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(3, 1, kernel_size=1),
+            nn.Flatten(),
+            nn.Sigmoid(),
+        )
+        self.max_timesteps = 50
         self.device = device
 
     def forward(self, x):
         B, C, H, W = x.shape
-        timesteps = torch.full((B,), 50, dtype=torch.long).to(self.device)
+        t_weight = self.timestep_predictor(x).view(-1)
+        timesteps = (t_weight * self.max_timesteps).long().clamp(1, self.max_timesteps)
+        timesteps = timesteps.to(self.device)
         with torch.no_grad():
             noise_pred = self.pipeline.unet(x, timesteps=timesteps).sample
         refined = torch.clamp(x + noise_pred, 0, 1)
@@ -284,6 +384,32 @@ def temporal_consistency_loss(pred_frames):
     return loss / (pred_frames.size(1) - 1)
 
 
+def optical_flow_consistency_loss(pred_frames: torch.Tensor) -> torch.Tensor:
+    """Penalize discrepancies after warping consecutive frames using optical flow."""
+    loss = 0.0
+    b, t, c, h, w = pred_frames.size()
+    prev = pred_frames[:, 0]
+    for i in range(1, t):
+        next_frame = pred_frames[:, i]
+        total_pair_loss = 0.0
+        for b_idx in range(b):
+            prev_np = (prev[b_idx].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            next_np = (next_frame[b_idx].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            prev_gray = cv2.cvtColor(prev_np, cv2.COLOR_RGB2GRAY)
+            next_gray = cv2.cvtColor(next_np, cv2.COLOR_RGB2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+            map_x = (grid_x + flow[..., 0]).astype(np.float32)
+            map_y = (grid_y + flow[..., 1]).astype(np.float32)
+            warped = cv2.remap(prev_np, map_x, map_y, cv2.INTER_LINEAR)
+            warped_tensor = torch.from_numpy(warped.transpose(2, 0, 1) / 255.0).to(pred_frames.device)
+            total_pair_loss += F.l1_loss(warped_tensor, next_frame[b_idx])
+        loss += total_pair_loss / b
+        prev = next_frame
+    loss = loss / (t - 1)
+    return loss
+
+
 class VideoSuperResolutionDiffusionModel(nn.Module):
     """Full video super-resolution model integrating diffusion refinement."""
 
@@ -298,10 +424,12 @@ class VideoSuperResolutionDiffusionModel(nn.Module):
         self.diffusion_refinement = DiffusionRefinement(device)
 
     def forward(self, x):
-        features_3d = self.encoder(x)
-        fused_features = self.temporal_fusion(features_3d)
-        bottleneck_features = self.transformer_bottleneck(fused_features)
-        sr = self.decoder(bottleneck_features)
+        feat3, feat2, feat1 = self.encoder(x)
+        fused3 = self.temporal_fusion(feat3)
+        fused2 = self.temporal_fusion(feat2)
+        fused1 = self.temporal_fusion(feat1)
+        bottleneck_features = self.transformer_bottleneck(fused3)
+        sr = self.decoder(bottleneck_features, fused2, fused1)
         refined_sr = self.diffusion_refinement(sr)
         return refined_sr
 
@@ -323,6 +451,9 @@ def train_model(
     model.train()
     for epoch in range(num_epochs):
         epoch_loss = 0.0
+        # progressively increase degradation complexity
+        if hasattr(dataloader.dataset, "degrade_level"):
+            dataloader.dataset.degrade_level = min(1.0, epoch / num_epochs)
         for lr_seq, hr_seq in dataloader:
             lr_seq = lr_seq.to(device)
             hr_seq = hr_seq.to(device)
@@ -337,12 +468,14 @@ def train_model(
 
             sr_seq = sr.unsqueeze(1).repeat(1, lr_seq.size(2), 1, 1, 1)
             loss_temp = temporal_consistency_loss(sr_seq)
+            loss_flow = optical_flow_consistency_loss(sr_seq.detach())
 
             total_loss = (
                 loss_l1
                 + 0.1 * loss_perc
                 + 0.1 * loss_clip
                 + 0.5 * loss_temp
+                + 0.1 * loss_flow
             )
             total_loss.backward()
             optimizer.step()
@@ -350,6 +483,25 @@ def train_model(
 
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}")
+
+
+def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
+    mse = F.mse_loss(pred, target).item()
+    return 20 * np.log10(1.0 / np.sqrt(mse + 1e-8))
+
+
+def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.device) -> None:
+    model.eval()
+    total_psnr = 0.0
+    with torch.no_grad():
+        for lr_seq, hr_seq in dataloader:
+            lr_seq = lr_seq.to(device)
+            hr_seq = hr_seq.to(device)
+            sr = model(lr_seq)
+            hr_central = hr_seq[:, :, hr_seq.size(2) // 2, :, :]
+            total_psnr += psnr(sr, hr_central)
+    avg_psnr = total_psnr / len(dataloader)
+    print(f"Validation PSNR: {avg_psnr:.2f}dB")
 
 
 if __name__ == "__main__":
@@ -363,4 +515,19 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     model = VideoSuperResolutionDiffusionModel(window_size=window_size, scale=scale, base_channels=64, device=device)
     train_model(model, dataloader, num_epochs, device)
+    evaluate_model(model, dataloader, device)
+
+    try:
+        import optuna
+
+        def objective(trial):
+            lr = trial.suggest_loguniform("lr", 1e-5, 1e-3)
+            optimizer = optim.Adam(model.parameters(), lr=lr)
+            train_model(model, dataloader, 1, device)
+            return 0.0
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=2)
+    except Exception:
+        print("Optuna not available; skipping hyperparameter tuning")
 
